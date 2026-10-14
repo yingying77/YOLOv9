@@ -110,32 +110,32 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
+      - name: Checkout repo # 新增：拉取仓库，提供.git上下文
+        uses: actions/checkout@v4
+
       - name: Download all ONNX artifacts
         uses: actions/download-artifact@v4
         with:
-          path: onnx
-          merge-multiple: true
+          path: ./onnx_output # 下载到当前仓库目录
 
       - name: List ONNX files
-        run: ls -lh onnx/
+        run: ls -la ./onnx_output
 
       - name: Create / update GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.release_tag }}"
-          if [ -z "$TAG" ]; then
-            TAG="onnx-$(date +%Y%m%d-%H%M%S)"
-          fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::notice::Release '$TAG' already exists, deleting it to refresh assets..."
-            gh release delete "$TAG" --yes --cleanup-tag
-          fi
-          gh release create "$TAG" onnx/*.onnx \
-            --title "YOLOv9 ONNX Models" \
-            --notes "YOLOv9 converted to ONNX (simplified). Models: ${{ inputs.model_sizes }}; Image sizes: ${{ inputs.img_sizes }}."
-          echo "Released: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+          # 定义release tag
+          RELEASE_TAG=${{ inputs.release_tag || format('onnx-build-{0}', github.sha) }}
+          # 删除旧tag（可选，如果需要覆盖）
+          git tag -d ${RELEASE_TAG} || true
+          git push origin :refs/tags/${RELEASE_TAG} || true
+          # 创建release，上传所有onnx文件
+          gh release create ${RELEASE_TAG} \
+            --title "YOLOv9 ONNX Build $RELEASE_TAG" \
+            --notes "Auto built YOLOv9 ONNX models from CI" \
+            --draft=false \
+            --prerelease=false \
+            ./onnx_output/*.onnx
