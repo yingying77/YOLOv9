@@ -1,0 +1,141 @@
+name: Build & Release YOLOv9 ONNX
+
+"on":
+  workflow_dispatch:
+    inputs:
+      model_sizes:
+        description: 'Model sizes, space separated (e.g. n s m c e)'
+        required: false
+        default: 'n s m c e'
+      img_sizes:
+        description: 'Image sizes, space separated (e.g. 320 640)'
+        required: false
+        default: '320'
+      release_tag:
+        description: 'Release tag to create / update (e.g. latest, v1.0). Empty = auto dated tag'
+        required: false
+        default: 'latest'
+
+# 需要写权限才能创建/更新 Release
+permissions:
+  contents: write
+
+jobs:
+  # 把 workflow_dispatch 输入的模型尺寸 / 图片尺寸 转成 matrix 的组合
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build matrix from inputs
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          models=(${{ inputs.model_sizes }})
+          imgs=(${{ inputs.img_sizes }})
+          combos=()
+          for m in "${models[@]}"; do
+            for i in "${imgs[@]}"; do
+              combos+=("{\"model\":\"$m\",\"img\":\"$i\"}")
+            done
+          done
+          echo "matrix=[$(IFS=,; echo "${combos[*]}")]" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      # 对应 Dockerfile: apt-get install cmake libgl1
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libgl1
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 对应 Dockerfile 的 ADD yolov9 仓库（runner 直连 GitHub，无需镜像）
+      - name: Clone YOLOv9
+        run: git clone --depth 1 https://github.com/WongKinYiu/yolov9.git yolov9
+
+      # 对应 Dockerfile 的两条 uv pip install（runner 上用 pip，效果一致）
+      - name: Install Python dependencies
+        working-directory: yolov9
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install onnx==1.18.0 onnxruntime onnx-simplifier==0.4.* onnxscript
+
+      # 对应 Dockerfile: ADD .../yolov9-${MODEL_SIZE}-converted.pt -> yolov9-${MODEL_SIZE}.pt
+      - name: Download weights
+        working-directory: yolov9
+        run: |
+          wget -q -O yolov9-${{ matrix.model }}.pt \
+            https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-${{ matrix.model }}-converted.pt
+
+      # 对应 Dockerfile 的 sed 补丁
+      - name: Patch experimental.py (torch 2.6 weights_only)
+        working-directory: yolov9
+        run: |
+          sed -i "s/ckpt = torch.load(attempt_download(w), map_location='cpu')/ckpt = torch.load(attempt_download(w), map_location='cpu', weights_only=False)/g" models/experimental.py
+
+      # 对应 Dockerfile 的 export.py
+      - name: Export to ONNX
+        working-directory: yolov9
+        run: |
+          python3 export.py --weights ./yolov9-${{ matrix.model }}.pt \
+            --imgsz ${{ matrix.img }} --simplify --include onnx
+
+      # 对应 Dockerfile 最终重命名 yolov9-${MODEL_SIZE}-${IMG_SIZE}.onnx
+      - name: Rename ONNX artifact
+        working-directory: yolov9
+        run: mv yolov9-${{ matrix.model }}.onnx yolov9-${{ matrix.model }}-${{ matrix.img }}.onnx
+
+      - name: Upload ONNX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yolov9-${{ matrix.model }}-${{ matrix.img }}
+          path: yolov9/yolov9-${{ matrix.model }}-${{ matrix.img }}.onnx
+          if-no-files-found: error
+
+  # 汇总所有 build 的 ONNX，发布到 GitHub Releases
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all ONNX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: onnx
+          merge-multiple: true
+
+      - name: List ONNX files
+        run: ls -lh onnx/
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="onnx-$(date +%Y%m%d-%H%M%S)"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release '$TAG' already exists, deleting it to refresh assets..."
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" onnx/*.onnx \
+            --title "YOLOv9 ONNX Models" \
+            --notes "YOLOv9 converted to ONNX (simplified). Models: ${{ inputs.model_sizes }}; Image sizes: ${{ inputs.img_sizes }}."
+          echo "Released: https://github.com/${{ github.repository }}/releases/tag/$TAG"
